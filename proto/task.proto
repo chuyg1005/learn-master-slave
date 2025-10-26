@@ -1,0 +1,39 @@
+syntax = "proto3";
+package taskpb;
+option go_package = "learn-master-slave/taskpb";
+
+message Task {
+  string id = 1;
+  string payload = 2;
+  int32 attempts = 3;
+}
+
+message TaskResult {
+  string id = 1;
+  bool success = 2;
+  string error = 3;
+}
+
+message WorkerHello {
+  string worker_id = 1;
+}
+
+message MasterMsg {
+  oneof m {
+    Task task = 1;
+    string ping = 2;
+  }
+}
+
+message WorkerMsg {
+  oneof m {
+    WorkerHello hello = 1;
+    TaskResult result = 2;
+  }
+}
+
+service Master {
+  // Bidirectional stream: Worker -> Master (WorkerMsg), Master -> Worker (MasterMsg)
+  rpc WorkerStream(stream WorkerMsg) returns (stream MasterMsg);
+}
+
