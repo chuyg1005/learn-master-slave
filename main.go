@@ -46,16 +46,19 @@ type WorkerConn struct {
 type MasterServer struct {
 	pb.UnimplementedMasterServer
 
-	mu        sync.Mutex
-	workers   map[string]*WorkerConn
-	tasks     map[string]*TaskEntry
+	mu      sync.Mutex
+	workers map[string]*WorkerConn
+	// 执行中的任务数组，超时错误等都会将任务移除
+	tasks map[string]*TaskEntry
+	// 任务队列
 	taskQueue chan *pb.Task
 }
 
 func NewMaster() *MasterServer {
 	return &MasterServer{
-		workers:   make(map[string]*WorkerConn),
-		tasks:     make(map[string]*TaskEntry),
+		workers: make(map[string]*WorkerConn),
+		tasks:   make(map[string]*TaskEntry),
+		// 总的任务队列
 		taskQueue: make(chan *pb.Task, 1024),
 	}
 }
@@ -72,6 +75,7 @@ func (m *MasterServer) WorkerStream(stream pb.Master_WorkerStreamServer) error {
 	// reader goroutine
 	go func() {
 		for {
+			// 收到消息
 			wm, err := stream.Recv()
 			if err != nil {
 				done <- err
@@ -114,6 +118,7 @@ func (m *MasterServer) WorkerStream(stream pb.Master_WorkerStreamServer) error {
 			case <-wc.ctx.Done():
 				senderErr <- wc.ctx.Err()
 				return
+				// 有任务，直接发送到客户端
 			case mm := <-wc.msgs:
 				if err := stream.Send(mm); err != nil {
 					senderErr <- err
@@ -126,6 +131,7 @@ func (m *MasterServer) WorkerStream(stream pb.Master_WorkerStreamServer) error {
 	// main loop: handle incoming worker messages and lifecycle
 	for {
 		select {
+		// 收到客户端的回复
 		case wm := <-recv:
 			if r := wm.GetResult(); r != nil {
 				m.handleResult(r)
@@ -161,8 +167,10 @@ func (m *MasterServer) handleResult(r *pb.TaskResult) {
 		return
 	}
 	if r.Success {
+		// 任务执行成功
 		te.Status = Success
 		if te.cancelFn != nil {
+			// 取消超时检测
 			te.cancelFn() // cancel timeout
 		}
 		log.Printf("task %s succeeded", r.Id)
@@ -188,16 +196,20 @@ func (m *MasterServer) handleResult(r *pb.TaskResult) {
 
 // dispatch loop: take tasks from taskQueue and assign to an available worker
 func (m *MasterServer) dispatchLoop() {
+	// 所有任务都在这个队列里面
 	for t := range m.taskQueue {
+		// 寻找worker节点调度
 		assigned := m.assignTask(t)
 		if !assigned {
 			log.Printf("no available worker, requeue task %s", t.Id)
 			// simple backoff
+			// 调度失败，等待时间再次调度
 			time.AfterFunc(time.Second, func() { m.taskQueue <- t })
 		}
 	}
 }
 
+// 选择一个worker节点，发送任务给这个worker节点，可能失败
 func (m *MasterServer) assignTask(t *pb.Task) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -223,13 +235,16 @@ func (m *MasterServer) assignTask(t *pb.Task) bool {
 	te := &TaskEntry{Task: t, Status: Running, Assigned: chosen.id, Start: time.Now(), Attempts: t.Attempts}
 	ctx, cancel := context.WithCancel(context.Background())
 	te.cancelFn = cancel
+	// 同时记录任务到taskMap，用于追踪状态
 	m.tasks[t.Id] = te
 
 	// send task
 	mm := &pb.MasterMsg{M: &pb.MasterMsg_Task{Task: t}}
 	select {
+	// 发送到任务队列成功
 	case chosen.msgs <- mm:
 		log.Printf("assigned task %s to worker %s", t.Id, chosen.id)
+		// 队列满了
 	default:
 		log.Printf("worker %s msg channel full, cannot assign", chosen.id)
 		delete(m.tasks, t.Id)
@@ -246,6 +261,7 @@ func (m *MasterServer) waitTaskTimeout(ctx context.Context, taskID string, d tim
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
+	// 任务已经执行结束，可能成功或者失败
 	case <-ctx.Done():
 		return
 	case <-timer.C:
@@ -256,6 +272,7 @@ func (m *MasterServer) waitTaskTimeout(ctx context.Context, taskID string, d tim
 			m.mu.Unlock()
 			return
 		}
+		// 任务执行超时了，需要重新调度
 		// mark timeout, remove and reschedule
 		te.Status = Timeout
 		log.Printf("task %s timed out on worker %s", taskID, te.Assigned)
@@ -265,6 +282,7 @@ func (m *MasterServer) waitTaskTimeout(ctx context.Context, taskID string, d tim
 		if te.Attempts < 3 {
 			te.Attempts++
 			te.Task.Attempts = te.Attempts
+			// 重新触发调度
 			m.taskQueue <- te.Task
 		} else {
 			log.Printf("task %s reached max attempts after timeout", taskID)
@@ -293,6 +311,7 @@ func main() {
 	go func() {
 		id := 1
 		for {
+			// 随机产生任务
 			t := &pb.Task{Id: fmt.Sprintf("task-%d", id), Payload: fmt.Sprintf("payload-%d", id), Attempts: 0}
 			id++
 			master.taskQueue <- t
