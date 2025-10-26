@@ -1,456 +1,119 @@
-// Project: go-distributed-master-worker-demo
-// Layout (in this single text file we show all files you need):
+# Go Distributed Master-Worker Demo
+
+This is a distributed task processing system implemented in Go using gRPC for communication between a master node and multiple worker nodes. The system demonstrates a master-worker architecture where the master distributes tasks to connected workers, tracks their execution status, handles failures, and implements timeout mechanisms.
+
+## Architecture Overview
+
+The system consists of:
+- **Master**: Central coordinator that manages tasks and worker connections
+- **Workers**: Execute tasks assigned by the master
+- **gRPC Communication**: Bidirectional streaming for real-time communication
+
+## Key Features
 
-/*
+1. **Task Distribution**: Master distributes tasks to available workers
+2. **Task Status Tracking**: Master maintains status of all active tasks
+3. **Failure Handling**: Automatic rescheduling of failed tasks (up to 3 attempts)
+4. **Timeout Management**: Tasks that exceed execution time are timed out and rescheduled
+5. **Worker Management**: Dynamic registration and deregistration of workers
+6. **Load Distribution**: Simple random worker selection for task assignment
 
-1) proto/task.proto
+## Project Structure
 
+```
+.
+├── go.mod
+├── go.sum
+├── main.go              # Master implementation
+├── proto/
+│   ├── task.proto       # Protocol buffer definitions
+│   └── learn-master-slave/
+│       └── taskpb/      # Generated protobuf code
+├── readme.md            # This file
+└── worker/
+    └── main.go          # Worker implementation
+```
 
-2) go.mod
+## Protocol Design
 
-module demo.masterworker
+The communication between master and workers is defined in `task.proto`:
 
-go 1.20
-
-require (
-google.golang.org/grpc v1.56.0
-github.com/golang/protobuf v1.5.2
-)
-
-// (You may need to adjust versions in your environment.)
-
-
-3) Instructions to generate Go protobuf code
-
-# Install protoc and Go plugins, then run:
-# protoc --go_out=. --go-grpc_out=. proto/task.proto
-
-This will produce taskpb/task.pb.go and taskpb/task_grpc.pb.go in a local package named taskpb.
-
-
-4) cmd/master/main.go
-
-package main
-
-import (
-"context"
-"errors"
-"flag"
-"fmt"
-"log"
-"math/rand"
-"net"
-"sync"
-"time"
-
-    "google.golang.org/grpc"
-
-    pb "taskpb"
-)
-
-// TaskStatus represents the task lifecycle maintained by master
-type TaskStatus string
-
-const (
-Pending TaskStatus = "PENDING"
-Running TaskStatus = "RUNNING"
-Success TaskStatus = "SUCCESS"
-Failed  TaskStatus = "FAILED"
-Timeout TaskStatus = "TIMEOUT"
-)
-
-type TaskEntry struct {
-Task      *pb.Task
-Status    TaskStatus
-Assigned  string // worker id
-Start     time.Time
-Attempts  int32
-cancelFn  context.CancelFunc
-}
-
-// WorkerConn wraps a connected worker stream
-type WorkerConn struct {
-id     string
-msgs   chan *pb.MasterMsg
-ctx    context.Context
-cancel context.CancelFunc
-}
-
-type MasterServer struct {
-pb.UnimplementedMasterServer
-
-    mu        sync.Mutex
-    workers   map[string]*WorkerConn
-    tasks     map[string]*TaskEntry
-    taskQueue chan *pb.Task
-}
-
-func NewMaster() *MasterServer {
-return &MasterServer{
-workers:   make(map[string]*WorkerConn),
-tasks:     make(map[string]*TaskEntry),
-taskQueue: make(chan *pb.Task, 1024),
-}
-}
-
-// WorkerStream handles bidirectional stream with worker
-func (m *MasterServer) WorkerStream(stream pb.Master_WorkerStreamServer) error {
-// First, receive hello (worker registers)
-// We will also concurrently send MasterMsg via stream.Send
-
-    // Create channels
-    recv := make(chan *pb.WorkerMsg)
-    done := make(chan error, 1)
-
-    // reader goroutine
-    go func() {
-        for {
-            wm, err := stream.Recv()
-            if err != nil {
-                done <- err
-                return
-            }
-            recv <- wm
-        }
-    }()
-
-    var workerID string
-    // waiting for hello
-    select {
-    case wm := <-recv:
-        if h := wm.GetHello(); h != nil {
-            workerID = h.WorkerId
-        } else {
-            return errors.New("expected hello first")
-        }
-    case err := <-done:
-        return err
-    case <-time.After(5 * time.Second):
-        return errors.New("timeout waiting for hello")
-    }
-
-    // register worker
-    ctx, cancel := context.WithCancel(context.Background())
-    wc := &WorkerConn{id: workerID, msgs: make(chan *pb.MasterMsg, 128), ctx: ctx, cancel: cancel}
-
-    m.mu.Lock()
-    m.workers[workerID] = wc
-    m.mu.Unlock()
-
-    log.Printf("worker %s connected", workerID)
-
-    // sender goroutine
-    senderErr := make(chan error, 1)
-    go func() {
-        for {
-            select {
-            case <-wc.ctx.Done():
-                senderErr <- wc.ctx.Err()
-                return
-            case mm := <-wc.msgs:
-                if err := stream.Send(mm); err != nil {
-                    senderErr <- err
-                    return
-                }
-            }
-        }
-    }()
-
-    // main loop: handle incoming worker messages and lifecycle
-    for {
-        select {
-        case wm := <-recv:
-            if r := wm.GetResult(); r != nil {
-                m.handleResult(r)
-            }
-        case err := <-senderErr:
-            log.Printf("sender error for worker %s: %v", workerID, err)
-            m.unregisterWorker(workerID)
-            return err
-        case err := <-done:
-            log.Printf("recv error for worker %s: %v", workerID, err)
-            m.unregisterWorker(workerID)
-            return err
-        }
-    }
-}
-
-func (m *MasterServer) unregisterWorker(id string) {
-m.mu.Lock()
-if wc, ok := m.workers[id]; ok {
-wc.cancel()
-close(wc.msgs)
-delete(m.workers, id)
-}
-m.mu.Unlock()
-}
-
-func (m *MasterServer) handleResult(r *pb.TaskResult) {
-m.mu.Lock()
-defer m.mu.Unlock()
-te, ok := m.tasks[r.Id]
-if !ok {
-log.Printf("received result for unknown task %s", r.Id)
-return
-}
-if r.Success {
-te.Status = Success
-if te.cancelFn != nil {
-te.cancelFn() // cancel timeout
-}
-log.Printf("task %s succeeded", r.Id)
-// cleanup
-delete(m.tasks, r.Id)
-} else {
-te.Status = Failed
-if te.cancelFn != nil {
-te.cancelFn()
-}
-log.Printf("task %s failed: %s", r.Id, r.Error)
-delete(m.tasks, r.Id)
-// reschedule if attempts < 3
-if te.Attempts < 3 {
-te.Attempts++
-te.Task.Attempts = te.Attempts
-go func(t *pb.Task) { m.taskQueue <- t }(te.Task)
-} else {
-log.Printf("task %s reached max attempts", r.Id)
-}
-}
-}
-
-// dispatch loop: take tasks from taskQueue and assign to an available worker
-func (m *MasterServer) dispatchLoop() {
-for t := range m.taskQueue {
-assigned := m.assignTask(t)
-if !assigned {
-log.Printf("no available worker, requeue task %s", t.Id)
-// simple backoff
-time.AfterFunc(time.Second, func() { m.taskQueue <- t })
-}
-}
-}
-
-func (m *MasterServer) assignTask(t *pb.Task) bool {
-m.mu.Lock()
-defer m.mu.Unlock()
-if len(m.workers) == 0 {
-return false
-}
-// pick a random worker for simplicity
-idx := rand.Intn(len(m.workers))
-var chosen *WorkerConn
-i := 0
-for _, w := range m.workers {
-if i == idx {
-chosen = w
-break
-}
-i++
-}
-if chosen == nil {
-return false
-}
-
-    // create task entry and start timeout watcher
-    te := &TaskEntry{Task: t, Status: Running, Assigned: chosen.id, Start: time.Now(), Attempts: t.Attempts}
-    ctx, cancel := context.WithCancel(context.Background())
-    te.cancelFn = cancel
-    m.tasks[t.Id] = te
-
-    // send task
-    mm := &pb.MasterMsg{M: &pb.MasterMsg_Task{Task: t}}
-    select {
-    case chosen.msgs <- mm:
-        log.Printf("assigned task %s to worker %s", t.Id, chosen.id)
-    default:
-        log.Printf("worker %s msg channel full, cannot assign", chosen.id)
-        delete(m.tasks, t.Id)
-        return false
-    }
-
-    // start timeout watcher goroutine
-    go m.waitTaskTimeout(ctx, t.Id, 10*time.Second)
-
-    return true
-}
-
-func (m *MasterServer) waitTaskTimeout(ctx context.Context, taskID string, d time.Duration) {
-timer := time.NewTimer(d)
-defer timer.Stop()
-select {
-case <-ctx.Done():
-return
-case <-timer.C:
-// timeout occurred
-m.mu.Lock()
-te, ok := m.tasks[taskID]
-if !ok {
-m.mu.Unlock()
-return
-}
-// mark timeout, remove and reschedule
-te.Status = Timeout
-log.Printf("task %s timed out on worker %s", taskID, te.Assigned)
-delete(m.tasks, taskID)
-m.mu.Unlock()
-
-        if te.Attempts < 3 {
-            te.Attempts++
-            te.Task.Attempts = te.Attempts
-            m.taskQueue <- te.Task
-        } else {
-            log.Printf("task %s reached max attempts after timeout", taskID)
-        }
-    }
-}
-
-func main() {
-port := flag.Int("port", 50051, "master gRPC port")
-flag.Parse()
-
-    rand.Seed(time.Now().UnixNano())
-
-    lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
-    if err != nil {
-        log.Fatalf("failed to listen: %v", err)
-    }
-    grpcServer := grpc.NewServer()
-    master := NewMaster()
-    pb.RegisterMasterServer(grpcServer, master)
-
-    // start dispatcher
-    go master.dispatchLoop()
-
-    // for demo: populate some tasks periodically
-    go func() {
-        id := 1
-        for {
-            t := &pb.Task{Id: fmt.Sprintf("task-%d", id), Payload: fmt.Sprintf("payload-%d", id), Attempts: 0}
-            id++
-            master.taskQueue <- t
-            time.Sleep(2 * time.Second)
-        }
-    }()
-
-    log.Printf("master listening on %d", *port)
-    if err := grpcServer.Serve(lis); err != nil {
-        log.Fatalf("Serve: %v", err)
-    }
-}
-
-
-5) cmd/worker/main.go
-
-package main
-
-import (
-"context"
-"flag"
-"fmt"
-"io"
-"log"
-"time"
-
-    "google.golang.org/grpc"
-
-    pb "taskpb"
-)
-
-func runWorker(masterAddr, workerID string) error {
-conn, err := grpc.Dial(masterAddr, grpc.WithInsecure())
-if err != nil {
-return err
-}
-defer conn.Close()
-
-    client := pb.NewMasterClient(conn)
-    ctx := context.Background()
-    // open stream
-    stream, err := client.WorkerStream(ctx)
-    if err != nil {
-        return err
-    }
-
-    // send hello
-    if err := stream.Send(&pb.WorkerMsg{M: &pb.WorkerMsg_Hello{Hello: &pb.WorkerHello{WorkerId: workerID}}}); err != nil {
-        return err
-    }
-
-    // receiver goroutine
-    go func() {
-        for {
-            mm, err := stream.Recv()
-            if err == io.EOF {
-                log.Println("stream closed by master")
-                return
-            }
-            if err != nil {
-                log.Printf("recv error: %v", err)
-                return
-            }
-            if t := mm.GetTask(); t != nil {
-                go handleTask(stream, t)
-            }
-        }
-    }()
-
-    // keep alive
-    select {}
-}
-
-func handleTask(stream pb.Master_WorkerStreamClient, task *pb.Task) {
-log.Printf("worker: got task %s payload=%s attempts=%d", task.Id, task.Payload, task.Attempts)
-// simulate work; fail if payload contains "fail" or random
-// simulate variable duration
-dur := time.Duration(2+task.Attempts) * time.Second
-time.Sleep(dur)
-
-    success := true
-    var errStr string
-    // random fail for demo
-    if task.Attempts%2 == 1 {
-        // if attempts odd, simulate failure (demo)
-        success = false
-        errStr = "simulated-error"
-    }
-
-    // send result back
-    res := &pb.WorkerMsg{M: &pb.WorkerMsg_Result{Result: &pb.TaskResult{Id: task.Id, Success: success, Error: errStr}}}
-    if err := stream.Send(res); err != nil {
-        log.Printf("failed to send result: %v", err)
-    }
-}
-
-func main() {
-master := flag.String("master", "localhost:50051", "master address")
-id := flag.String("id", "worker-1", "worker id")
-flag.Parse()
-
-    log.Printf("worker %s connecting to %s", *id, *master)
-    if err := runWorker(*master, *id); err != nil {
-        log.Fatalf("worker error: %v", err)
-    }
-}
-
-
-6) How to run (after generating protobuf Go code):
-
-# Start master (default port 50051)
-$ go run cmd/master/main.go
-
-# Start one or more workers
-$ go run cmd/worker/main.go --id=worker-1 --master=localhost:50051
-$ go run cmd/worker/main.go --id=worker-2 --master=localhost:50051
-
-The master will periodically create tasks and dispatch them to connected workers. Workers simulate execution and send back results; the master tracks status, handles timeouts (10s), and reschedules failed/timeout tasks up to 3 attempts.
-
-
-Notes / Improvements:
-- In production, replace random assignment with smart scheduling (least-loaded, weighted, data locality, etc.)
-- Persist task state to durable storage (DB) if crash-resilient tracking required
-- Use TLS for gRPC (credentials)
-- Add leader election (etcd) if Master should be highly available
-- Implement exponential backoff and jitter for retries
-
-*/
+- **Task**: Represents a unit of work with ID, payload, and attempt count
+- **TaskResult**: Contains the result of task execution (success/failure)
+- **WorkerHello**: Worker registration message with ID
+- **MasterMsg**: Messages from master to worker (tasks, ping)
+- **WorkerMsg**: Messages from worker to master (hello, results)
+- **Master Service**: Defines the bidirectional streaming RPC
+
+## Master Implementation Details
+
+The master maintains several key data structures:
+- `workers`: Map of connected workers
+- `tasks`: Map of active tasks with their status and metadata
+- `taskQueue`: Channel for pending tasks
+
+### Key Components
+
+1. **WorkerStream**: Handles bidirectional communication with workers
+2. **dispatchLoop**: Continuously assigns tasks from queue to available workers
+3. **assignTask**: Selects a worker and sends task for execution
+4. **handleResult**: Processes results from workers
+5. **waitTaskTimeout**: Monitors tasks for timeout conditions
+
+## Worker Implementation Details
+
+Workers connect to the master and:
+1. Register with a unique ID
+2. Listen for tasks from the master
+3. Execute tasks with simulated work duration
+4. Report results back to the master
+
+## How to Run
+
+1. **Generate protobuf code**:
+   ```bash
+   protoc --go_out=. --go-grpc_out=. proto/task.proto
+   ```
+
+2. **Start the master**:
+   ```bash
+   go run main.go
+   ```
+   By default, the master listens on port 50051.
+
+3. **Start workers**:
+   ```bash
+   go run worker/main.go --id=worker-1 --master=localhost:50051
+   go run worker/main.go --id=worker-2 --master=localhost:50051
+   ```
+   You can start multiple workers with different IDs.
+
+## Interaction Flow
+
+See `interaction-diagram.txt` for a detailed diagram of the communication between master and workers.
+
+## Demo Behavior
+
+- The master generates tasks periodically (every 2 seconds)
+- Workers simulate task execution with a delay
+- Workers randomly fail tasks for demonstration purposes
+- Failed tasks are retried up to 3 times
+- Tasks that exceed 10 seconds are timed out and rescheduled
+
+## Possible Improvements
+
+1. **Smart Scheduling**: Replace random worker selection with load-based scheduling
+2. **Persistence**: Store task state in a database for crash recovery
+3. **Security**: Use TLS for gRPC communication
+4. **High Availability**: Implement master leader election for fault tolerance
+5. **Advanced Retry Logic**: Implement exponential backoff for task retries
+
+## Dependencies
+
+- Go 1.16+
+- gRPC-Go
+- Protocol Buffers
+
+## License
+
+This project is provided as a learning example and is free to use and modify.

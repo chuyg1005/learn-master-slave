@@ -1,0 +1,52 @@
+Master-Worker Interaction Diagram
+===============================
+
+1. Initial Connection:
+   Worker --> Master: Connects via gRPC bidirectional stream
+   Worker --> Master: Sends Hello message with Worker ID
+
+2. Worker Registration:
+   Master: Registers worker in workers map
+   Master: Creates WorkerConn with message channel
+
+3. Task Generation:
+   Master: Generates tasks periodically (demo)
+   Master: Adds tasks to taskQueue channel
+
+4. Task Dispatch:
+   Master (dispatchLoop): Takes tasks from taskQueue
+   Master: Selects available worker (random selection)
+   Master --> Worker: Sends Task via worker's message channel
+
+5. Task Execution:
+   Worker: Receives task from master stream
+   Worker: Spawns goroutine to handle task
+   Worker: Simulates work with time.Sleep
+   Worker: Determines success/failure (demo logic)
+
+6. Result Reporting:
+   Worker --> Master: Sends TaskResult via stream
+
+7. Result Handling:
+   Master: Updates task status
+   Master: Removes task from active tasks map
+   Master: If failed, reschedules task (max 3 attempts)
+   Master: If timeout, reschedules task (max 3 attempts)
+
+8. Timeout Handling:
+   Master: Starts timeout watcher goroutine for each task
+   Master: If timeout occurs, marks task as TIMEOUT
+   Master: Reschedules timed out tasks (max 3 attempts)
+
+9. Worker Disconnection:
+   Master: Detects worker disconnection
+   Master: Unregisters worker from workers map
+   Master: Cleans up worker resources
+   Master: Reschedules any tasks assigned to disconnected worker
+
+Key Components:
+- Master: Central coordinator managing tasks and workers
+- Worker: Executes tasks assigned by master
+- Task Queue: Channel holding pending tasks
+- Worker Connections: Bidirectional gRPC streams
+- Task Tracking: Map of active tasks with status and metadata
